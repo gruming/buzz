@@ -5683,6 +5683,7 @@ async fn reap_idle_sessions(
     min_agents: usize,
 ) -> ReapSummary {
     let mut summary = ReapSummary::default();
+    let mut reaped_owners = Vec::new();
     for slot in pool.agents_mut().iter_mut() {
         let Some(agent) = slot.as_mut() else {
             continue;
@@ -5713,6 +5714,7 @@ async fn reap_idle_sessions(
                 agent.state.invalidate_scope(scope);
             }
             summary.sessions_closed += due.len();
+            reaped_owners.extend(due.into_iter().map(|scope| (scope, agent.index)));
             if agent
                 .state
                 .heartbeat_last_used
@@ -5746,6 +5748,11 @@ async fn reap_idle_sessions(
                 summary.agents_released += 1;
             }
         }
+    }
+    // A reaped scope keeps no session, so its owner entry would only hold new
+    // events there until that worker finishes an unrelated turn.
+    for (scope, agent_index) in &reaped_owners {
+        pool.forget_scope_owner(scope, *agent_index);
     }
     summary
 }
@@ -9807,6 +9814,82 @@ mod error_outcome_emission_tests {
             assert_eq!(
                 closed_session_ids(&capture),
                 vec!["sess-rotated".to_string()]
+            );
+            let _ = std::fs::remove_file(capture);
+        }
+
+        // A reaped scope must not stay pinned to its former worker: otherwise a
+        // new event there is held until that worker finishes an unrelated turn.
+        #[tokio::test]
+        async fn reaped_scope_is_not_held_for_its_busy_former_owner() {
+            let capture = capture_path("owner");
+            let mut owner = recording_agent(0, &capture).await;
+            let base = tokio::time::Instant::now();
+            let reaped = scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            let live = scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            owner
+                .state
+                .sessions
+                .insert(reaped.clone(), "sess-reaped".into());
+            owner.state.last_used.insert(reaped.clone(), base);
+            owner
+                .state
+                .sessions
+                .insert(live.clone(), "sess-live".into());
+            owner
+                .state
+                .last_used
+                .insert(live.clone(), base + Duration::from_secs(500));
+            let mut pool = AgentPool::from_slots(vec![Some(owner), Some(dummy_agent(1).await)]);
+            pool.record_scope_owner(reaped.clone(), 0);
+            pool.record_scope_owner(live.clone(), 0);
+
+            let summary = reap_idle_sessions(
+                &mut pool,
+                base + Duration::from_secs(600),
+                Duration::from_secs(600),
+                2,
+            )
+            .await;
+            assert_eq!(summary.sessions_closed, 1);
+
+            // The former owner is checked out for a turn in its live scope.
+            let busy = pool.try_claim(Some(&live)).expect("owner is idle");
+            assert_eq!(busy.index, 0);
+            let abort_handle = pool.join_set.spawn(async {});
+            pool.task_map_mut().insert(
+                abort_handle.id(),
+                pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(live.channel_id()),
+                    scope: Some(live.clone()),
+                    turn_id: "t".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: std::collections::HashSet::new(),
+                },
+            );
+
+            assert!(
+                !pool.should_hold_for_busy_owner(&reaped),
+                "reaped scope must not wait for its former owner"
+            );
+            let fresh = pool
+                .try_claim(Some(&reaped))
+                .expect("an idle worker takes the reaped scope");
+            assert_eq!(fresh.index, 1);
+            assert!(
+                !fresh.state.sessions.contains_key(&reaped),
+                "the new turn opens a fresh session"
+            );
+            assert!(
+                pool.should_hold_for_busy_owner(&live),
+                "a live scope's owner entry is kept"
             );
             let _ = std::fs::remove_file(capture);
         }

@@ -961,6 +961,15 @@ impl AgentPool {
         self.session_owners.insert(scope, agent_index);
     }
 
+    /// Drop `scope`'s owner entry if it still names `agent_index`, after that
+    /// worker closed its session for the scope (idle reaping). A newer owner
+    /// recorded by another worker is left in place.
+    pub fn forget_scope_owner(&mut self, scope: &SessionScope, agent_index: usize) {
+        if self.session_owners.get(scope) == Some(&agent_index) {
+            self.session_owners.remove(scope);
+        }
+    }
+
     /// True when this scope should be **held** (left queued) rather than
     /// dispatched to a fresh worker, because the worker that owns its provider
     /// session is currently checked out (busy on another turn).
