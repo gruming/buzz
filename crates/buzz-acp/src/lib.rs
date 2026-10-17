@@ -3061,7 +3061,7 @@ async fn tokio_main() -> Result<()> {
                 &pool,
                 &queue,
                 &crash_history,
-                fleet.as_ref().is_some_and(FleetPool::is_waiting),
+                fleet_blocks_fill(&pool, &mut fleet),
             );
             if wanted > 0 {
                 refill_slots(
@@ -3090,7 +3090,7 @@ async fn tokio_main() -> Result<()> {
                 &pool,
                 &queue,
                 &crash_history,
-                fleet.as_ref().is_some_and(FleetPool::is_waiting),
+                fleet_blocks_fill(&pool, &mut fleet),
             );
             refill_slots(
                 &pool,
@@ -5591,6 +5591,12 @@ fn park_batch(queue: &mut EventQueue, mut batch: FlushBatch) {
         );
     }
     queue.mark_complete(&scope);
+}
+
+/// Whether an exhausted fleet still blocks on-demand fill.
+fn fleet_blocks_fill(pool: &AgentPool, fleet: &mut Option<FleetPool>) -> bool {
+    let _ = pool;
+    fleet.as_ref().is_some_and(FleetPool::is_waiting)
 }
 
 /// How many on-demand slots to fill right now: waiting channels beyond what

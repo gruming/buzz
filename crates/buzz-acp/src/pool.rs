@@ -8082,6 +8082,92 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn parked_channel_dispatches_once_a_slot_frees_after_the_on_demand_agent_left() {
+        // Agent 0 is busy on a long turn; the on-demand agent 1 is up but the
+        // fleet is full, so the channel parks. Agent 1 is then reaped as
+        // surplus idle. Once a slot frees, the channel must go out on a
+        // refilled agent instead of waiting for agent 0's turn to end.
+        let dir = fleet_dir("latch");
+        let mut fleet = Some(crate::fleet::FleetPool::new(&dir, 1).expect("fleet dir"));
+        let mut sibling = crate::fleet::FleetPool::new(&dir, 1).expect("fleet dir");
+        let held = sibling
+            .try_acquire()
+            .expect("another harness holds the only slot");
+        let ctx = Arc::new(make_prompt_context_no_owner());
+        let mut pool =
+            AgentPool::from_slots(vec![Some(inert_agent(0).await), Some(inert_agent(1).await)]);
+        let busy = pool.try_claim(None).expect("agent 0 checked out");
+        assert_eq!(busy.index, 0);
+        let base = tokio::time::Instant::now();
+        pool.agents_mut()[1]
+            .as_mut()
+            .expect("on-demand agent")
+            .state
+            .idle_since = Some(base);
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        let waiting = Uuid::new_v4();
+        assert!(queue.push(queued_event(waiting)));
+        let mut last_activity = tokio::time::Instant::now();
+
+        let dispatched =
+            crate::dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, &mut fleet);
+        assert!(dispatched.is_empty(), "fleet full: the channel parks");
+        assert!(fleet.as_ref().unwrap().is_waiting());
+
+        let reaped = crate::reap_idle_sessions(
+            &mut pool,
+            base + std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(600),
+            1,
+        )
+        .await;
+        assert_eq!(reaped.agents_released, 1, "surplus idle agent released");
+        assert!(!pool.any_idle(), "only the busy agent 0 is left");
+
+        drop(held);
+        let circuits: Vec<crate::SlotCircuit> = (0..2)
+            .map(|_| crate::SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            })
+            .collect();
+        // A sibling test mid-`spawn` can hold a duplicate of the dropped lock
+        // descriptor for a moment (see `FleetPool::try_acquire`).
+        let mut blocked = true;
+        for _ in 0..50 {
+            blocked = crate::fleet_blocks_fill(&pool, &mut fleet);
+            if !blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !blocked,
+            "a freed slot lifts the fleet wait even though no agent is idle to acquire it"
+        );
+        assert_eq!(
+            crate::on_demand_fill(&pool, &queue, &circuits, blocked),
+            1,
+            "the parked channel asks for an on-demand agent again"
+        );
+
+        pool.agents_mut()[1] = Some(inert_agent(1).await);
+        let dispatched =
+            crate::dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, &mut fleet);
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "dispatched while agent 0 is still busy"
+        );
+        assert_eq!(dispatched[0].0.channel_id(), waiting);
+
+        pool.join_set.abort_all();
+        drop(busy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
         let cases = [
