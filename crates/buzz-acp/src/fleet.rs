@@ -119,6 +119,30 @@ impl FleetPool {
         }
         None
     }
+
+    /// Re-check a waiting fleet without keeping a slot: clear the wait when a
+    /// slot is free now. Returns whether the fleet is still waiting. For
+    /// callers that would otherwise never acquire again (no idle agent), so a
+    /// slot freed meanwhile is not missed.
+    pub fn refresh_waiting(&mut self) -> bool {
+        let Some(since) = self.waiting_since else {
+            return false;
+        };
+        for index in 0..self.slots {
+            let path = self.dir.join(format!("slot-{index:02}.lock"));
+            if let Ok(Some(_probe)) = try_lock_file(&path) {
+                self.waiting_since = None;
+                tracing::info!(
+                    target: "fleet",
+                    slot = index,
+                    waited_secs = since.elapsed().as_secs(),
+                    "fleet slot free again — wait cleared"
+                );
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// `Ok(Some)` = locked, `Ok(None)` = held by someone else, `Err` = cannot
@@ -191,6 +215,36 @@ mod tests {
         assert!(!pool.is_waiting());
         drop(second);
         drop(reused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn refresh_waiting_clears_only_when_a_slot_is_free_and_keeps_none() {
+        let dir = scratch_dir("refresh");
+        let mut pool = FleetPool::new(&dir, 1).expect("create slot dir");
+        let mut other = FleetPool::new(&dir, 1).expect("same dir");
+        assert!(!pool.refresh_waiting(), "not waiting, nothing to do");
+
+        let held = other.try_acquire().expect("other harness holds the slot");
+        assert!(pool.try_acquire().is_none());
+        assert!(pool.refresh_waiting(), "still full");
+        assert!(pool.is_waiting());
+
+        drop(held);
+        let mut cleared = false;
+        for _ in 0..50 {
+            if !pool.refresh_waiting() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(cleared, "a freed slot clears the wait");
+        assert!(!pool.is_waiting());
+        let slot = acquire_soon(&mut other)
+            .await
+            .expect("the probe did not keep the slot");
+        drop(slot);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

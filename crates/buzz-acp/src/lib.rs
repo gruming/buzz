@@ -5593,10 +5593,17 @@ fn park_batch(queue: &mut EventQueue, mut batch: FlushBatch) {
     queue.mark_complete(&scope);
 }
 
-/// Whether an exhausted fleet still blocks on-demand fill.
+/// Whether an exhausted fleet still blocks on-demand fill. Only a successful
+/// acquire clears the wait, and dispatch only acquires while an agent is idle;
+/// with every agent busy (say the on-demand agent that parked was then reaped)
+/// nothing would clear it, and queued channels would wait for an unrelated
+/// turn to end. So re-probe the fleet in exactly that case.
 fn fleet_blocks_fill(pool: &AgentPool, fleet: &mut Option<FleetPool>) -> bool {
-    let _ = pool;
-    fleet.as_ref().is_some_and(FleetPool::is_waiting)
+    match fleet.as_mut() {
+        Some(fleet) if !pool.any_idle() => fleet.refresh_waiting(),
+        Some(fleet) => fleet.is_waiting(),
+        None => false,
+    }
 }
 
 /// How many on-demand slots to fill right now: waiting channels beyond what
