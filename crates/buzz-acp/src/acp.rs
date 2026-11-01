@@ -125,7 +125,7 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
 
 fn build_initialize_params() -> serde_json::Value {
     serde_json::json!({
-        "protocolVersion": 2,
+        "protocolVersion": 1,
         "clientCapabilities": build_client_capabilities(),
         "clientInfo": {
             "name": "buzz-acp",
@@ -2545,7 +2545,7 @@ mod tests {
             "id": 0u64,
             "method": "initialize",
             "params": {
-                "protocolVersion": 2,
+                "protocolVersion": 1,
                 "clientCapabilities": build_client_capabilities(),
                 "clientInfo": {
                     "name": "buzz-acp",
@@ -2553,7 +2553,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(msg["params"]["protocolVersion"].as_u64(), Some(2));
+        assert_eq!(msg["params"]["protocolVersion"].as_u64(), Some(1));
         assert_eq!(
             msg["params"]["clientInfo"]["name"].as_str(),
             Some("buzz-acp")
