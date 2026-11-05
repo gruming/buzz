@@ -553,6 +553,19 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_IDLE_CLOSE", default_value_t = 0)]
     pub session_idle_close: u64,
 
+    /// Let agent work between harness turns push back `--session-idle-close`,
+    /// but close the session once this many seconds have passed since the
+    /// harness's last turn, however busy it still is. 0 = off: only harness
+    /// turns count and `--session-bg-hold` is ignored.
+    #[arg(long, env = "BUZZ_ACP_SESSION_ACTIVITY_CAP", default_value_t = 0)]
+    pub session_activity_cap: u64,
+
+    /// Keep a session open this many seconds after it starts a background task
+    /// (`run_in_background`), even if it goes silent. Needs
+    /// `--session-activity-cap`, which still bounds it. 0 = no hold.
+    #[arg(long, env = "BUZZ_ACP_SESSION_BG_HOLD", default_value_t = 0)]
+    pub session_bg_hold: u64,
+
     /// In DM channels, when a turn ends without the agent having published a
     /// message, post the agent's trailing reply text as a top-level channel
     /// message so the human never gets silence. Channels are unaffected.
@@ -661,6 +674,11 @@ pub struct Config {
     pub fleet_slot_dir: PathBuf,
     /// Seconds a session may sit without a turn before it is closed. 0 = never.
     pub session_idle_close_secs: u64,
+    /// Longest agent activity may keep a session open past the harness's last
+    /// turn. 0 = activity does not count.
+    pub session_activity_cap_secs: u64,
+    /// How long a background-task start keeps a silent session open.
+    pub session_bg_hold_secs: u64,
     /// Auto-post trailing reply text in DMs when the agent published nothing.
     pub dm_autopublish: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
@@ -1248,6 +1266,8 @@ impl Config {
             fleet_slots: args.fleet_slots,
             fleet_slot_dir: args.fleet_slot_dir.unwrap_or_else(default_fleet_slot_dir),
             session_idle_close_secs: args.session_idle_close,
+            session_activity_cap_secs: args.session_activity_cap,
+            session_bg_hold_secs: args.session_bg_hold,
             dm_autopublish: args.dm_autopublish,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
@@ -1273,7 +1293,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{} min_agents={} fleet_slots={} fleet_slot_dir={} session_idle_close={}s dm_autopublish={}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{} min_agents={} fleet_slots={} fleet_slot_dir={} session_idle_close={}s session_activity_cap={}s session_bg_hold={}s dm_autopublish={}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1301,6 +1321,8 @@ impl Config {
             self.fleet_slots,
             self.fleet_slot_dir.display(),
             self.session_idle_close_secs,
+            self.session_activity_cap_secs,
+            self.session_bg_hold_secs,
             self.dm_autopublish,
         )
     }
@@ -1648,6 +1670,8 @@ mod tests {
             fleet_slots: 0,
             fleet_slot_dir: PathBuf::new(),
             session_idle_close_secs: 0,
+            session_activity_cap_secs: 0,
+            session_bg_hold_secs: 0,
             dm_autopublish: true,
             agent_owner: None,
             no_base_prompt: false,

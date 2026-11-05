@@ -43,8 +43,8 @@ use fleet::FleetPool;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    AgentPool, ControlSignal, IdleActivitySummary, IdleSwitchResult, OwnedAgent, PromptContext,
+    PromptOutcome, PromptResult, PromptSource, SessionActivityLimits, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -2996,6 +2996,11 @@ async fn tokio_main() -> Result<()> {
     // ticks so sessions invalidated on a live adapter get their
     // `session/close`; the idle bound itself is opt-in.
     let session_idle_close_bound = Duration::from_secs(config.session_idle_close_secs);
+    let session_activity_limits = SessionActivityLimits {
+        cap: Duration::from_secs(config.session_activity_cap_secs),
+        bg_hold: Duration::from_secs(config.session_bg_hold_secs),
+    };
+    let mut last_sessions_extended = 0;
     let mut session_reaper = {
         let interval = if session_idle_close_bound.is_zero() {
             Duration::from_secs(30)
@@ -3642,20 +3647,38 @@ async fn tokio_main() -> Result<()> {
                 _ = session_reaper.tick() => {
                     let _ = result_rx; // end split borrow before touching pool
                     if pool_ready {
+                        let now = tokio::time::Instant::now();
+                        let activity = absorb_idle_activity(
+                            &mut pool,
+                            now,
+                            session_idle_close_bound,
+                            session_activity_limits,
+                        )
+                        .await;
+                        if activity.saw_work {
+                            last_activity = now;
+                        }
                         let summary = reap_idle_sessions(
                             &mut pool,
-                            tokio::time::Instant::now(),
+                            now,
                             session_idle_close_bound,
                             config.min_agents as usize,
                         )
                         .await;
-                        if summary.sessions_closed > 0 || summary.agents_released > 0 {
+                        // The extended count holds for many ticks in a row:
+                        // log its changes, not every tick.
+                        if summary.sessions_closed > 0
+                            || summary.agents_released > 0
+                            || activity.sessions_extended != last_sessions_extended
+                        {
                             tracing::info!(
                                 sessions_closed = summary.sessions_closed,
                                 agents_released = summary.agents_released,
+                                sessions_extended = activity.sessions_extended,
                                 "session_reaper"
                             );
                         }
+                        last_sessions_extended = activity.sessions_extended;
                     }
                     None
                 }
@@ -3673,12 +3696,25 @@ async fn tokio_main() -> Result<()> {
                     // keeps `work_queued` true for a retry-throttled batch too,
                     // so a failed turn awaiting backoff is never stranded — the
                     // next iteration dispatches or re-wakes it.
+                    let now = tokio::time::Instant::now();
+                    if pool_ready
+                        && absorb_idle_activity(
+                            &mut pool,
+                            now,
+                            session_idle_close_bound,
+                            session_activity_limits,
+                        )
+                        .await
+                        .saw_work
+                    {
+                        last_activity = now;
+                    }
                     if idle_pool_sleep_due(
                         pool_ready,
                         last_activity,
-                        tokio::time::Instant::now(),
+                        now,
                         idle_pool_sleep_bound,
-                        queue.has_in_flight() || heartbeat_in_flight,
+                        queue.has_in_flight() || heartbeat_in_flight || pool.any_bg_hold(now),
                         !pool.join_set.is_empty(),
                         queue.has_undispatched_work(),
                         !wake_tasks.is_empty()
@@ -4575,12 +4611,21 @@ fn dispatch_pending(
     for batch in fleet_parked {
         park_batch(queue, batch);
     }
-    tracing::debug!(
-        dispatched = dispatched_channels.len(),
-        fleet_parked = parked,
-        queue_depth = queue.pending_channels(),
-        "dispatch_pending"
-    );
+    if parked > 0 {
+        tracing::info!(
+            dispatched = dispatched_channels.len(),
+            fleet_parked = parked,
+            queue_depth = queue.pending_channels(),
+            "dispatch_pending"
+        );
+    } else {
+        tracing::debug!(
+            dispatched = dispatched_channels.len(),
+            fleet_parked = parked,
+            queue_depth = queue.pending_channels(),
+            "dispatch_pending"
+        );
+    }
     dispatched_channels
 }
 
@@ -5678,6 +5723,46 @@ fn refill_slots(
     }
 }
 
+/// Lines read from one idle agent per pass, so a chatty adapter cannot hold
+/// up the main loop. What is left waits for the next pass.
+const IDLE_DRAIN_LINE_BUDGET: usize = 2_000;
+
+/// Read what idle agents wrote between harness turns and let their work move
+/// the sessions' idle clocks. Without this nobody reads an idle agent's stdout,
+/// so the reaper closes sessions mid-work. Off (no read at all) when
+/// `limits.cap` or `bound` is zero.
+async fn absorb_idle_activity(
+    pool: &mut AgentPool,
+    now: tokio::time::Instant,
+    bound: Duration,
+    limits: SessionActivityLimits,
+) -> IdleActivitySummary {
+    let mut summary = IdleActivitySummary::default();
+    if limits.cap.is_zero() || bound.is_zero() {
+        return summary;
+    }
+    for agent in pool.agents_mut().iter_mut().flatten() {
+        if let Err(error) = agent.acp.drain_idle_lines(IDLE_DRAIN_LINE_BUDGET).await {
+            // Whoever uses this adapter next hits and handles the same error.
+            tracing::warn!(
+                target: "pool::session",
+                agent = agent.index,
+                "reading idle agent output failed: {error}"
+            );
+        }
+        // Between-turn text is no turn's reply; the next prompt would discard
+        // it anyway, so do not let it pile up until then.
+        let _ = agent.acp.take_turn_reply();
+        let activity = agent.acp.take_session_activity();
+        let found = agent
+            .state
+            .absorb_session_activity(&activity, now, bound, limits, agent.index);
+        summary.saw_work |= found.saw_work;
+        summary.sessions_extended += found.sessions_extended;
+    }
+    summary
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReapSummary {
     sessions_closed: usize,
@@ -5712,6 +5797,11 @@ async fn reap_idle_sessions(
                         .last_used
                         .get(scope)
                         .is_some_and(|last| now.duration_since(*last) >= bound)
+                        && agent
+                            .state
+                            .bg_hold_until
+                            .get(scope)
+                            .is_none_or(|until| now >= *until)
                 })
                 .cloned()
                 .collect();
@@ -5732,6 +5822,10 @@ async fn reap_idle_sessions(
                 .state
                 .heartbeat_last_used
                 .is_some_and(|last| now.duration_since(last) >= bound)
+                && agent
+                    .state
+                    .heartbeat_bg_hold_until
+                    .is_none_or(|until| now >= until)
             {
                 tracing::info!(
                     target: "pool::session",
@@ -9440,6 +9534,8 @@ mod build_mcp_servers_tests {
             fleet_slots: 0,
             fleet_slot_dir: std::path::PathBuf::new(),
             session_idle_close_secs: 0,
+            session_activity_cap_secs: 0,
+            session_bg_hold_secs: 0,
             dm_autopublish: true,
             agent_owner: None,
             no_base_prompt: false,
@@ -9671,6 +9767,8 @@ mod error_outcome_emission_tests {
             fleet_slots: 0,
             fleet_slot_dir: std::path::PathBuf::new(),
             session_idle_close_secs: 0,
+            session_activity_cap_secs: 0,
+            session_bg_hold_secs: 0,
             dm_autopublish: true,
             agent_owner: None,
             no_base_prompt: false,
@@ -9720,7 +9818,9 @@ mod error_outcome_emission_tests {
 
     mod session_pool_tests {
         use super::*;
-        use crate::{on_demand_fill, reap_idle_sessions, refill_slots, ReapSummary};
+        use crate::{
+            absorb_idle_activity, on_demand_fill, reap_idle_sessions, refill_slots, ReapSummary,
+        };
 
         fn capture_path(name: &str) -> std::path::PathBuf {
             std::env::temp_dir().join(format!(
@@ -9828,6 +9928,356 @@ mod error_outcome_emission_tests {
                 closed_session_ids(&capture),
                 vec!["sess-rotated".to_string()]
             );
+            let _ = std::fs::remove_file(capture);
+        }
+
+        const IDLE_BOUND: Duration = Duration::from_secs(600);
+        const LIMITS: crate::pool::SessionActivityLimits = crate::pool::SessionActivityLimits {
+            cap: Duration::from_secs(3_600),
+            bg_hold: Duration::from_secs(1_800),
+        };
+
+        fn session_update(session_id: &str, update: serde_json::Value) -> String {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": session_id, "update": update },
+            })
+            .to_string()
+        }
+
+        fn work_update(session_id: &str) -> String {
+            session_update(
+                session_id,
+                serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "working" },
+                }),
+            )
+        }
+
+        fn background_update(session_id: &str, kind: &str) -> String {
+            session_update(
+                session_id,
+                serde_json::json!({
+                    "sessionUpdate": kind,
+                    "toolCallId": "tool-1",
+                    "rawInput": { "command": "sleep 650", "run_in_background": true },
+                }),
+            )
+        }
+
+        /// A `recording_agent` that first writes `lines` to stdout, as an
+        /// adapter does between turns. Returns once they are readable.
+        async fn agent_with_output(capture: &std::path::Path, lines: &[String]) -> OwnedAgent {
+            let marker = capture.with_extension("written");
+            let emit: String = lines
+                .iter()
+                .map(|line| format!("printf '%s\n' '{line}'; "))
+                .collect();
+            let script = format!(
+                r#"{emit}touch '{marker}'; n=0; while IFS= read -r line; do printf '%s
+' "$line" >> '{capture}'; printf '{{"jsonrpc":"2.0","id":%d,"result":{{}}}}
+' "$n"; n=$((n+1)); done"#,
+                marker = marker.display(),
+                capture = capture.display(),
+            );
+            let mut agent = dummy_agent(0).await;
+            agent.acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .expect("spawn scripted adapter");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "adapter never started"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = std::fs::remove_file(marker);
+            agent
+        }
+
+        /// A session whose harness turn ended at `at`.
+        fn open_session(
+            agent: &mut OwnedAgent,
+            session_id: &str,
+            at: tokio::time::Instant,
+        ) -> scope::SessionScope {
+            let scope = scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), session_id.into());
+            agent.state.touch(&PromptSource::Channel(scope.clone()), at);
+            scope
+        }
+
+        fn agent_of(pool: &mut AgentPool) -> &mut OwnedAgent {
+            pool.agents_mut()[0].as_mut().expect("agent kept")
+        }
+
+        #[tokio::test]
+        async fn activity_during_idle_keeps_session_open_past_bound() {
+            let capture = capture_path("activity");
+            let mut agent = agent_with_output(&capture, &[work_update("sess-1")]).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            let now = turn_end + IDLE_BOUND;
+
+            let activity = absorb_idle_activity(&mut pool, now, IDLE_BOUND, LIMITS).await;
+            let summary = reap_idle_sessions(&mut pool, now, IDLE_BOUND, 1).await;
+
+            assert_eq!(
+                activity,
+                crate::pool::IdleActivitySummary {
+                    saw_work: true,
+                    sessions_extended: 1
+                }
+            );
+            assert_eq!(summary, ReapSummary::default());
+            assert!(agent_of(&mut pool).state.sessions.contains_key(&scope));
+            assert!(closed_session_ids(&capture).is_empty());
+            agent_of(&mut pool).acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn silent_session_closes_after_last_activity_plus_bound() {
+            let capture = capture_path("silent");
+            let mut agent = agent_with_output(&capture, &[work_update("sess-1")]).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+            absorb_idle_activity(&mut pool, turn_end + IDLE_BOUND, IDLE_BOUND, LIMITS).await;
+            let last_work = agent_of(&mut pool).state.last_used[&scope];
+            assert!(last_work > turn_end, "the update moved the idle clock");
+
+            let before = last_work + IDLE_BOUND - Duration::from_secs(1);
+            absorb_idle_activity(&mut pool, before, IDLE_BOUND, LIMITS).await;
+            let summary = reap_idle_sessions(&mut pool, before, IDLE_BOUND, 1).await;
+            assert_eq!(summary.sessions_closed, 0);
+
+            let due = last_work + IDLE_BOUND;
+            let activity = absorb_idle_activity(&mut pool, due, IDLE_BOUND, LIMITS).await;
+            let summary = reap_idle_sessions(&mut pool, due, IDLE_BOUND, 1).await;
+            assert!(!activity.saw_work, "no new work since the last pass");
+            assert_eq!(summary.sessions_closed, 1);
+            assert_eq!(closed_session_ids(&capture), vec!["sess-1".to_string()]);
+            agent_of(&mut pool).acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn background_tool_call_holds_session_until_hold_expires() {
+            let capture = capture_path("hold");
+            let mut agent =
+                agent_with_output(&capture, &[background_update("sess-1", "tool_call")]).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+            absorb_idle_activity(&mut pool, turn_end, IDLE_BOUND, LIMITS).await;
+            let until = agent_of(&mut pool).state.bg_hold_until[&scope];
+
+            for now in [
+                until - LIMITS.bg_hold + IDLE_BOUND,
+                until - Duration::from_secs(1),
+            ] {
+                let activity = absorb_idle_activity(&mut pool, now, IDLE_BOUND, LIMITS).await;
+                let summary = reap_idle_sessions(&mut pool, now, IDLE_BOUND, 1).await;
+                assert_eq!(activity.sessions_extended, 1, "held, not idle-closed");
+                assert_eq!(summary.sessions_closed, 0);
+            }
+
+            let activity = absorb_idle_activity(&mut pool, until, IDLE_BOUND, LIMITS).await;
+            let summary = reap_idle_sessions(&mut pool, until, IDLE_BOUND, 1).await;
+            assert_eq!(activity.sessions_extended, 0);
+            assert_eq!(summary.sessions_closed, 1);
+            assert_eq!(closed_session_ids(&capture), vec!["sess-1".to_string()]);
+            let agent = agent_of(&mut pool);
+            assert!(agent.state.bg_hold_until.is_empty());
+            assert!(agent.state.reap_anchor.is_empty());
+            agent.acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn background_flag_in_tool_call_update_also_holds() {
+            // The wire order `claude-agent-acp` really uses: the opening
+            // `tool_call` has an empty input, an update carries the flag.
+            let capture = capture_path("hold-update");
+            let opening = |session_id: &str| {
+                session_update(
+                    session_id,
+                    serde_json::json!({ "sessionUpdate": "tool_call", "rawInput": {} }),
+                )
+            };
+            let lines = [
+                opening("sess-flagged"),
+                background_update("sess-flagged", "tool_call_update"),
+                opening("sess-plain"),
+            ];
+            let mut agent = agent_with_output(&capture, &lines).await;
+            let turn_end = tokio::time::Instant::now();
+            let flagged = open_session(&mut agent, "sess-flagged", turn_end);
+            let plain = open_session(&mut agent, "sess-plain", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+            absorb_idle_activity(&mut pool, turn_end, IDLE_BOUND, LIMITS).await;
+
+            let agent = agent_of(&mut pool);
+            assert!(agent.state.bg_hold_until.contains_key(&flagged));
+            assert!(!agent.state.bg_hold_until.contains_key(&plain));
+            agent.acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn activity_cap_closes_session_despite_continuous_updates() {
+            let capture = capture_path("cap");
+            let mut agent = recording_agent(0, &capture).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            let tick = Duration::from_secs(30);
+
+            // Work on every tick up to and including the cap, background task too.
+            let mut now = turn_end;
+            let summary = loop {
+                now += tick;
+                let record = crate::acp::SessionActivity {
+                    last_work: Some(now),
+                    last_background_start: Some(now),
+                };
+                let activity = std::collections::HashMap::from([("sess-1".to_string(), record)]);
+                agent_of(&mut pool)
+                    .state
+                    .absorb_session_activity(&activity, now, IDLE_BOUND, LIMITS, 0);
+                let summary = reap_idle_sessions(&mut pool, now, IDLE_BOUND, 1).await;
+                if now == turn_end + LIMITS.cap {
+                    break summary;
+                }
+                assert_eq!(summary.sessions_closed, 0, "closed early");
+            };
+
+            assert_eq!(summary.sessions_closed, 1);
+            assert!(!agent_of(&mut pool).state.sessions.contains_key(&scope));
+            assert_eq!(closed_session_ids(&capture), vec!["sess-1".to_string()]);
+            agent_of(&mut pool).acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn metadata_updates_do_not_extend_idle_clock() {
+            let capture = capture_path("metadata");
+            let lines: Vec<String> = [
+                "usage_update",
+                "session_info_update",
+                "available_commands_update",
+                "keepalive",
+            ]
+            .iter()
+            .map(|kind| session_update("sess-1", serde_json::json!({ "sessionUpdate": kind })))
+            .collect();
+            let mut agent = agent_with_output(&capture, &lines).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            let now = turn_end + IDLE_BOUND;
+
+            let activity = absorb_idle_activity(&mut pool, now, IDLE_BOUND, LIMITS).await;
+            assert_eq!(activity, crate::pool::IdleActivitySummary::default());
+            assert_eq!(agent_of(&mut pool).state.last_used[&scope], turn_end);
+
+            let summary = reap_idle_sessions(&mut pool, now, IDLE_BOUND, 1).await;
+            assert_eq!(summary.sessions_closed, 1);
+            agent_of(&mut pool).acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn zero_activity_cap_keeps_current_behaviour() {
+            use clap::Parser;
+            let key = "0".repeat(64);
+            let args = crate::config::CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+            assert_eq!(args.session_activity_cap, 0, "off unless configured");
+            assert_eq!(args.session_bg_hold, 0, "off unless configured");
+
+            let capture = capture_path("zero");
+            let lines = [
+                work_update("sess-1"),
+                background_update("sess-1", "tool_call"),
+            ];
+            let mut agent = agent_with_output(&capture, &lines).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            let now = turn_end + IDLE_BOUND;
+            // A hold configured without a cap is ignored.
+            let limits = crate::pool::SessionActivityLimits {
+                cap: Duration::ZERO,
+                bg_hold: LIMITS.bg_hold,
+            };
+
+            let activity = absorb_idle_activity(&mut pool, now, IDLE_BOUND, limits).await;
+            assert_eq!(activity, crate::pool::IdleActivitySummary::default());
+            let agent = agent_of(&mut pool);
+            assert_eq!(agent.state.last_used[&scope], turn_end);
+            assert!(agent.state.bg_hold_until.is_empty());
+            assert_eq!(
+                agent.acp.drain_idle_lines(2_000).await.expect("drain"),
+                lines.len(),
+                "the pass above must not have read the agent's output"
+            );
+            assert!(!pool.any_bg_hold(now));
+
+            let summary = reap_idle_sessions(&mut pool, now, IDLE_BOUND, 1).await;
+            assert_eq!(
+                summary,
+                ReapSummary {
+                    sessions_closed: 1,
+                    agents_released: 0
+                }
+            );
+            assert_eq!(closed_session_ids(&capture), vec!["sess-1".to_string()]);
+            agent_of(&mut pool).acp.shutdown().await;
+            let _ = std::fs::remove_file(capture);
+        }
+
+        #[tokio::test]
+        async fn bg_hold_defers_idle_pool_sleep() {
+            let capture = capture_path("sleep");
+            let mut agent =
+                agent_with_output(&capture, &[background_update("sess-1", "tool_call")]).await;
+            let turn_end = tokio::time::Instant::now();
+            let scope = open_session(&mut agent, "sess-1", turn_end);
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            absorb_idle_activity(&mut pool, turn_end, IDLE_BOUND, LIMITS).await;
+            let until = agent_of(&mut pool).state.bg_hold_until[&scope];
+            // Long past the sleep bound, so only the hold can defer it.
+            let sleep_bound = Duration::from_secs(60);
+            let sleep_due = |pool: &AgentPool, now| {
+                crate::idle_pool_sleep_due(
+                    true,
+                    turn_end,
+                    now,
+                    sleep_bound,
+                    pool.any_bg_hold(now),
+                    false,
+                    false,
+                    false,
+                )
+            };
+
+            assert!(!sleep_due(&pool, until - Duration::from_secs(1)));
+            assert!(sleep_due(&pool, until), "the hold has run out");
+            agent_of(&mut pool).acp.shutdown().await;
             let _ = std::fs::remove_file(capture);
         }
 

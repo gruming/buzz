@@ -8,7 +8,9 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
-use futures_util::StreamExt;
+use std::collections::HashMap;
+
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -138,6 +140,16 @@ fn build_initialize_params() -> serde_json::Value {
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
 /// same client via repeated calls to [`session_new`](AcpClient::session_new).
+/// Work seen on one session's update stream, read back by the idle reaper via
+/// [`AcpClient::take_session_activity`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionActivity {
+    /// Last work update: agent text, thought, tool call or plan.
+    pub last_work: Option<tokio::time::Instant>,
+    /// Last tool call whose input asked for `run_in_background`.
+    pub last_background_start: Option<tokio::time::Instant>,
+}
+
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
@@ -220,6 +232,8 @@ pub struct AcpClient {
     turn_reply_text: String,
     /// Whether a `tool_call` in this turn carried `buzz messages send`.
     turn_saw_buzz_send: bool,
+    /// session id → work seen since the reaper last collected it.
+    session_activity: HashMap<String, SessionActivity>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -571,6 +585,7 @@ impl AcpClient {
             standard_adapter,
             turn_reply_text: String::new(),
             turn_saw_buzz_send: false,
+            session_activity: HashMap::new(),
         })
     }
 
@@ -868,6 +883,7 @@ impl AcpClient {
     /// than the 60s request default because callers run this inline on an
     /// idle agent from the main loop.
     pub async fn session_close(&mut self, session_id: &str) -> Result<(), AcpError> {
+        self.session_activity.remove(session_id);
         let params = serde_json::json!({
             "sessionId": session_id,
         });
@@ -1259,26 +1275,9 @@ impl AcpClient {
             }
 
             // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
-
-            let msg: serde_json::Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.observe(
-                        "acp_parse_error",
-                        serde_json::json!({
-                            "line": trimmed,
-                            "error": e.to_string(),
-                        }),
-                    );
-                    tracing::warn!(
-                        target: "acp::wire",
-                        "failed to parse line as JSON: {e} — skipping"
-                    );
-                    continue;
-                }
+            let Some(msg) = self.parse_wire_line(trimmed) else {
+                continue;
             };
-            self.observe("acp_read", msg.clone());
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1292,36 +1291,141 @@ impl AcpClient {
                 }
             }
 
-            // Dispatch by method name (notifications and agent-initiated requests).
-            if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
-                match method {
-                    "session/update" => {
-                        let _ = self.handle_session_update(&msg);
+            self.dispatch_agent_message(&msg).await?;
+        }
+    }
+
+    /// Log and parse one non-empty stdout line. A line that is not JSON is
+    /// reported and yields `None` so the caller skips it.
+    fn parse_wire_line(&mut self, trimmed: &str) -> Option<serde_json::Value> {
+        tracing::debug!(target: "acp::wire", "← {trimmed}");
+
+        let msg: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                self.observe(
+                    "acp_parse_error",
+                    serde_json::json!({
+                        "line": trimmed,
+                        "error": e.to_string(),
+                    }),
+                );
+                tracing::warn!(
+                    target: "acp::wire",
+                    "failed to parse line as JSON: {e} — skipping"
+                );
+                return None;
+            }
+        };
+        self.observe("acp_read", msg.clone());
+        Some(msg)
+    }
+
+    /// Dispatch by method name (notifications and agent-initiated requests).
+    /// A message without a method is a response nobody is waiting for: ignored.
+    async fn dispatch_agent_message(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
+        if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+            match method {
+                "session/update" => {
+                    let _ = self.handle_session_update(msg);
+                }
+                "_goose/unstable/session/update" => {
+                    self.handle_goose_usage_update(msg);
+                }
+                "session/request_permission" => {
+                    self.handle_permission_request(msg).await?;
+                }
+                other => {
+                    // If the unknown message has an id, it's a request expecting a reply.
+                    // Silence would cause the agent to hang waiting for a response.
+                    // Send a JSON-RPC -32601 "Method not found" error.
+                    if msg.get("id").is_some() {
+                        let err_resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "error": {"code": -32601, "message": format!("Method not found: {other}")}
+                        });
+                        // Surface write failures — a broken pipe means the
+                        // agent process is dead and continuing would hang.
+                        self.write_ndjson(&err_resp).await?;
                     }
-                    "_goose/unstable/session/update" => {
-                        self.handle_goose_usage_update(&msg);
-                    }
-                    "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
-                    }
-                    other => {
-                        // If the unknown message has an id, it's a request expecting a reply.
-                        // Silence would cause the agent to hang waiting for a response.
-                        // Send a JSON-RPC -32601 "Method not found" error.
-                        if msg.get("id").is_some() {
-                            let err_resp = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": msg["id"],
-                                "error": {"code": -32601, "message": format!("Method not found: {other}")}
-                            });
-                            // Surface write failures — a broken pipe means the
-                            // agent process is dead and continuing would hang.
-                            self.write_ndjson(&err_resp).await?;
-                        }
-                        tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
-                    }
+                    tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Read whatever an idle agent has already written, without waiting, and
+    /// handle it as [`read_until_response`](Self::read_until_response) would.
+    /// Returns the number of non-empty lines consumed, at most `max_lines`;
+    /// the rest stays for the next call, as does an unterminated line.
+    ///
+    /// Must only run on an idle agent (nothing else may be reading its stdout).
+    pub(crate) async fn drain_idle_lines(&mut self, max_lines: usize) -> Result<usize, AcpError> {
+        let mut drained = 0;
+        while drained < max_lines {
+            // `unconstrained`: a spent coop budget would read as a quiet agent.
+            let line = match tokio::task::unconstrained(self.reader.next()).now_or_never() {
+                None => break,
+                Some(None) => return Err(AcpError::AgentExited),
+                Some(Some(Err(LinesCodecError::MaxLineLengthExceeded))) => {
+                    return Err(AcpError::Protocol(
+                        "agent stdout line exceeded 10MB limit".into(),
+                    ));
+                }
+                Some(Some(Err(e))) => {
+                    return Err(AcpError::Io(std::io::Error::other(e)));
+                }
+                Some(Some(Ok(line))) => line,
+            };
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            drained += 1;
+            if let Some(msg) = self.parse_wire_line(trimmed) {
+                self.dispatch_agent_message(&msg).await?;
+            }
+        }
+        Ok(drained)
+    }
+
+    /// Hand over the work recorded per session since the last call.
+    pub(crate) fn take_session_activity(&mut self) -> HashMap<String, SessionActivity> {
+        std::mem::take(&mut self.session_activity)
+    }
+
+    /// Note a work update on its session's activity record. Metadata updates
+    /// (`usage_update`, `session_info_update`, ...) are not work: they must
+    /// not keep an otherwise finished session open.
+    fn record_session_activity(&mut self, msg: &serde_json::Value, update_type: &str) {
+        if !matches!(
+            update_type,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        ) {
+            return;
+        }
+        let Some(session_id) = msg["params"]["sessionId"].as_str() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let record = self
+            .session_activity
+            .entry(session_id.to_owned())
+            .or_default();
+        record.last_work = Some(now);
+        // The input streams in: the opening `tool_call` carries `{}` and the
+        // flag first shows up on a later `tool_call_update`.
+        if matches!(update_type, "tool_call" | "tool_call_update")
+            && msg["params"]["update"]["rawInput"]["run_in_background"].as_bool() == Some(true)
+        {
+            record.last_background_start = Some(now);
         }
     }
 
@@ -1795,6 +1899,7 @@ impl AcpClient {
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        self.record_session_activity(msg, update_type);
 
         match update_type {
             "agent_message_chunk" => {
@@ -3496,6 +3601,170 @@ mod tests {
             .await;
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert_eq!(result.unwrap()["worked"], serde_json::json!(true));
+    }
+
+    /// Wait for a fake adapter's marker file, then let the runtime's I/O driver
+    /// see what the adapter wrote before it: a drain only finds lines the
+    /// driver has already reported.
+    async fn wait_for_marker(marker: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adapter never wrote {}",
+                marker.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    fn drain_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "buzz-acp-drain-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn drain_idle_lines_returns_without_blocking_on_silence() {
+        let mut client = spawn_script("sleep 10").await;
+        let drained = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.drain_idle_lines(2_000),
+        )
+        .await
+        .expect("drain must not wait for output")
+        .expect("a silent agent is not an error");
+        assert_eq!(drained, 0);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drain_idle_lines_keeps_partial_line_for_next_call() {
+        let first = drain_test_path("partial-first");
+        let go = drain_test_path("partial-go");
+        let last = drain_test_path("partial-last");
+        let script = format!(
+            r#"printf '%s' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1",'; touch '{first}'
+            while [ ! -e '{go}' ]; do sleep 0.01; done
+            printf '%s
+' '"update":{{"sessionUpdate":"plan"}}}}}}'; touch '{last}'; sleep 10"#,
+            first = first.display(),
+            go = go.display(),
+            last = last.display(),
+        );
+        let mut client = spawn_script(&script).await;
+
+        wait_for_marker(&first).await;
+        assert_eq!(client.drain_idle_lines(2_000).await.expect("drain"), 0);
+        assert!(client.take_session_activity().is_empty());
+
+        std::fs::write(&go, "").expect("release second half");
+        wait_for_marker(&last).await;
+        assert_eq!(client.drain_idle_lines(2_000).await.expect("drain"), 1);
+        assert!(
+            client.take_session_activity()["s1"].last_work.is_some(),
+            "both halves must parse as one update"
+        );
+
+        client.shutdown().await;
+        for path in [first, go, last] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_idle_lines_answers_permission_requests() {
+        let capture = drain_test_path("permission");
+        let script = format!(
+            r#"printf '%s
+' '{{"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{{"options":[{{"optionId":"no","kind":"reject_once"}},{{"optionId":"yes","kind":"allow_once"}}]}}}}'
+            IFS= read -r line; printf '%s
+' "$line" > '{tmp}'; mv '{tmp}' '{capture}'; sleep 10"#,
+            tmp = format!("{}.tmp", capture.display()),
+            capture = capture.display(),
+        );
+        let mut client = spawn_script(&script).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut drained = 0;
+        while drained == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no permission request"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            drained = client.drain_idle_lines(2_000).await.expect("drain");
+        }
+        assert_eq!(drained, 1);
+
+        wait_for_marker(&capture).await;
+        let reply: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("captured reply"))
+                .expect("reply is JSON");
+        assert_eq!(
+            reply,
+            permission_response_selected(&serde_json::json!(77), "yes")
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn drain_idle_lines_stops_at_line_budget() {
+        let marker = drain_test_path("budget");
+        let script = format!(
+            r#"for i in 1 2 3 4 5; do echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"keepalive"}}}}}}'; done; touch '{}'; sleep 10"#,
+            marker.display()
+        );
+        let mut client = spawn_script(&script).await;
+        wait_for_marker(&marker).await;
+
+        assert_eq!(client.drain_idle_lines(2).await.expect("drain"), 2);
+        assert_eq!(client.drain_idle_lines(2_000).await.expect("drain"), 3);
+        assert_eq!(client.drain_idle_lines(2_000).await.expect("drain"), 0);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn drain_idle_lines_unblocks_writer_past_pipe_capacity() {
+        // 3,000 lines of 200+ bytes is over 600 KiB, nine times the 64 KiB pipe:
+        // the marker can only appear once something has been reading.
+        let marker = drain_test_path("pipe");
+        let padding = "x".repeat(200);
+        let script = format!(
+            r#"for i in $(seq 1 3000); do echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"keepalive","pad":"{padding}"}}}}}}'; done; touch '{}'; sleep 10"#,
+            marker.display()
+        );
+        let mut client = spawn_script(&script).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !marker.exists(),
+            "with no reader the adapter must block on the full pipe"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut total = 0;
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adapter stayed blocked after {total} drained lines"
+            );
+            total += client.drain_idle_lines(2_000).await.expect("drain");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        wait_for_marker(&marker).await;
+        total += client.drain_idle_lines(2_000).await.expect("drain");
+        assert_eq!(total, 3_000);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_file(marker);
     }
 
     #[tokio::test]

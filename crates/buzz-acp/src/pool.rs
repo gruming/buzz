@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    ModelSwitchMethod, SessionActivity, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::fleet::FleetSlot;
@@ -160,6 +160,17 @@ pub struct SessionState {
     pub last_used: HashMap<SessionScope, tokio::time::Instant>,
     /// Idle clock for the heartbeat session.
     pub heartbeat_last_used: Option<tokio::time::Instant>,
+    /// session scope → when the harness last finished a turn there. Unlike
+    /// `last_used` it never follows agent activity, so it anchors
+    /// `--session-activity-cap`.
+    pub reap_anchor: HashMap<SessionScope, tokio::time::Instant>,
+    /// `reap_anchor` for the heartbeat session.
+    pub heartbeat_reap_anchor: Option<tokio::time::Instant>,
+    /// session scope → keep the session open until then: it started a
+    /// background task (`--session-bg-hold`).
+    pub bg_hold_until: HashMap<SessionScope, tokio::time::Instant>,
+    /// `bg_hold_until` for the heartbeat session.
+    pub heartbeat_bg_hold_until: Option<tokio::time::Instant>,
     /// When this agent was last returned to the pool. Drives the release of
     /// surplus on-demand adapters that hold no session.
     pub idle_since: Option<tokio::time::Instant>,
@@ -180,6 +191,8 @@ impl SessionState {
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
                 self.heartbeat_last_used = None;
+                self.heartbeat_reap_anchor = None;
+                self.heartbeat_bg_hold_until = None;
             }
         }
     }
@@ -209,6 +222,8 @@ impl SessionState {
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.last_used.remove(scope);
+        self.reap_anchor.remove(scope);
+        self.bg_hold_until.remove(scope);
         let session_id = self.sessions.remove(scope)?;
         Some((session_id, self.session_slots.remove(scope)))
     }
@@ -245,9 +260,11 @@ impl SessionState {
         match source {
             PromptSource::Channel(scope) if self.sessions.contains_key(scope) => {
                 self.last_used.insert(scope.clone(), now);
+                self.reap_anchor.insert(scope.clone(), now);
             }
             PromptSource::Heartbeat if self.heartbeat_session.is_some() => {
                 self.heartbeat_last_used = Some(now);
+                self.heartbeat_reap_anchor = Some(now);
             }
             _ => {}
         }
@@ -271,6 +288,97 @@ impl SessionState {
         self.pending_close.clear();
         self.last_used.clear();
         self.heartbeat_last_used = None;
+        self.reap_anchor.clear();
+        self.heartbeat_reap_anchor = None;
+        self.bg_hold_until.clear();
+        self.heartbeat_bg_hold_until = None;
+    }
+
+    /// Whether a background-task hold still keeps a session open.
+    pub(crate) fn has_bg_hold(&self, now: tokio::time::Instant) -> bool {
+        self.heartbeat_bg_hold_until
+            .is_some_and(|until| now < until)
+            || self.bg_hold_until.values().any(|until| now < *until)
+    }
+
+    /// Advance the idle clocks of this agent's sessions with the work its
+    /// adapter reported. `bound` is `--session-idle-close`; `limits.cap` must
+    /// be non-zero (the caller checks).
+    pub(crate) fn absorb_session_activity(
+        &mut self,
+        activity: &HashMap<String, SessionActivity>,
+        now: tokio::time::Instant,
+        bound: Duration,
+        limits: SessionActivityLimits,
+        agent_index: usize,
+    ) -> IdleActivitySummary {
+        let mut summary = IdleActivitySummary::default();
+        let channel_sessions: Vec<(SessionScope, String)> = self
+            .sessions
+            .iter()
+            .map(|(scope, session_id)| (scope.clone(), session_id.clone()))
+            .collect();
+        for (scope, session_id) in channel_sessions {
+            let Some(last_used) = self.last_used.get(&scope).copied() else {
+                continue;
+            };
+            let anchor = *self.reap_anchor.entry(scope.clone()).or_insert(last_used);
+            let step = advance_idle_clock(
+                last_used,
+                anchor,
+                self.bg_hold_until.get(&scope).copied(),
+                activity.get(&session_id),
+                now,
+                bound,
+                limits,
+            );
+            self.last_used.insert(scope.clone(), step.last_used);
+            match step.bg_hold_until {
+                Some(until) => {
+                    self.bg_hold_until.insert(scope.clone(), until);
+                }
+                None => {
+                    self.bg_hold_until.remove(&scope);
+                }
+            }
+            if step.capped {
+                tracing::warn!(
+                    target: "pool::session",
+                    agent = agent_index,
+                    channel = %scope.channel_id(),
+                    scope = %scope.telemetry_label(),
+                    activity_cap_secs = limits.cap.as_secs(),
+                    "session still active at the activity cap — closing"
+                );
+            }
+            summary.add(&step);
+        }
+        if let (Some(session_id), Some(last_used)) =
+            (self.heartbeat_session.clone(), self.heartbeat_last_used)
+        {
+            let anchor = *self.heartbeat_reap_anchor.get_or_insert(last_used);
+            let step = advance_idle_clock(
+                last_used,
+                anchor,
+                self.heartbeat_bg_hold_until,
+                activity.get(&session_id),
+                now,
+                bound,
+                limits,
+            );
+            self.heartbeat_last_used = Some(step.last_used);
+            self.heartbeat_bg_hold_until = step.bg_hold_until;
+            if step.capped {
+                tracing::warn!(
+                    target: "pool::session",
+                    agent = agent_index,
+                    activity_cap_secs = limits.cap.as_secs(),
+                    "heartbeat session still active at the activity cap — closing"
+                );
+            }
+            summary.add(&step);
+        }
+        summary
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -293,6 +401,87 @@ impl SessionState {
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
     }
+}
+
+/// How far agent activity may push back `--session-idle-close`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionActivityLimits {
+    /// Longest a session stays open past the harness's last turn, however busy
+    /// it is. Zero turns the whole feature off.
+    pub cap: Duration,
+    /// How long a background-task start keeps a silent session open.
+    pub bg_hold: Duration,
+}
+
+/// What one pass over idle agents' activity found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleActivitySummary {
+    /// An agent worked after the harness's last turn.
+    pub saw_work: bool,
+    /// Sessions open now that the turn-end clock alone would have closed.
+    pub sessions_extended: usize,
+}
+
+impl IdleActivitySummary {
+    fn add(&mut self, step: &IdleClockStep) {
+        self.saw_work |= step.saw_work;
+        self.sessions_extended += usize::from(step.extended);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IdleClockStep {
+    last_used: tokio::time::Instant,
+    bg_hold_until: Option<tokio::time::Instant>,
+    saw_work: bool,
+    extended: bool,
+    /// The cap is what closes this session: it would have stayed open otherwise.
+    capped: bool,
+}
+
+/// Apply one session's activity record to its idle clock. On reaching the cap
+/// the clock falls back to the anchor and the hold is dropped, so the reaper's
+/// plain idle check closes the session.
+fn advance_idle_clock(
+    last_used: tokio::time::Instant,
+    anchor: tokio::time::Instant,
+    bg_hold_until: Option<tokio::time::Instant>,
+    record: Option<&SessionActivity>,
+    now: tokio::time::Instant,
+    bound: Duration,
+    limits: SessionActivityLimits,
+) -> IdleClockStep {
+    let mut step = IdleClockStep {
+        last_used,
+        bg_hold_until,
+        saw_work: false,
+        extended: false,
+        capped: false,
+    };
+    if let Some(record) = record {
+        if let Some(work) = record.last_work.filter(|work| *work > last_used) {
+            step.last_used = work;
+            step.saw_work = true;
+        }
+        if !limits.bg_hold.is_zero() {
+            if let Some(started) = record.last_background_start {
+                let until = started + limits.bg_hold;
+                step.bg_hold_until = Some(step.bg_hold_until.map_or(until, |held| held.max(until)));
+            }
+        }
+    }
+    let idle_due = now.duration_since(step.last_used) >= bound
+        && step.bg_hold_until.is_none_or(|until| now >= until);
+    let since_anchor = now.duration_since(anchor);
+    // A cap below the idle bound could never close anything sooner.
+    if since_anchor >= limits.cap.max(bound) {
+        step.capped = !idle_due;
+        step.last_used = anchor;
+        step.bg_hold_until = None;
+    } else if !idle_due && since_anchor >= bound {
+        step.extended = true;
+    }
+    step
 }
 
 /// An agent with its session state, owned by the pool or a running task.
@@ -1175,6 +1364,14 @@ impl AgentPool {
 
     pub fn agents_mut(&mut self) -> &mut Vec<Option<OwnedAgent>> {
         &mut self.agents
+    }
+
+    /// Whether an idle agent still holds a session for a background task.
+    pub(crate) fn any_bg_hold(&self, now: tokio::time::Instant) -> bool {
+        self.agents
+            .iter()
+            .flatten()
+            .any(|agent| agent.state.has_bg_hold(now))
     }
 
     /// Remove the session for `channel_id` from all idle agents.
@@ -2449,10 +2646,9 @@ pub async fn run_prompt_task(
                         if let Some(slot) = agent.state.pending_slot.take() {
                             agent.state.session_slots.insert(scope.clone(), slot);
                         }
-                        agent
-                            .state
-                            .last_used
-                            .insert(scope.clone(), tokio::time::Instant::now());
+                        let created_at = tokio::time::Instant::now();
+                        agent.state.last_used.insert(scope.clone(), created_at);
+                        agent.state.reap_anchor.insert(scope.clone(), created_at);
                         // Seed a zero usage baseline: buzz-acp spawned this session
                         // so prior usage is zero by definition — first turn is reliable.
                         agent.acp.notify_session_spawned(&sid);
@@ -2516,7 +2712,9 @@ pub async fn run_prompt_task(
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
                         agent.state.heartbeat_slot = agent.state.pending_slot.take();
-                        agent.state.heartbeat_last_used = Some(tokio::time::Instant::now());
+                        let created_at = tokio::time::Instant::now();
+                        agent.state.heartbeat_last_used = Some(created_at);
+                        agent.state.heartbeat_reap_anchor = Some(created_at);
                         // Seed a zero usage baseline: buzz-acp spawned this session.
                         agent.acp.notify_session_spawned(&sid);
                         (sid, true)
